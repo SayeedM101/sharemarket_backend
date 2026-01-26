@@ -74,7 +74,7 @@ def forecast(symbol: str):
             {"symbol": symbol.upper()},
             {"_id": 0}
         )
-        .sort("timestamp", 1)
+        .sort("timestamp", -1)
         .limit(60)
     )
 

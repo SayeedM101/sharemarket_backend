@@ -1,11 +1,11 @@
-# scraper.py (SELENIUM VERSION – GUARANTEED)
+# scraper.py (SELENIUM VERSION – FIXED TIMELINE)
 
 from dotenv import load_dotenv
 load_dotenv()
 
 import os
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pymongo import MongoClient
 
 from selenium import webdriver
@@ -31,10 +31,17 @@ def scrape_and_store():
     print("🌐 Launching browser for DSE scrape...")
 
     options = Options()
-    options.add_argument("--headless")
-    options.add_argument("--disable-gpu")
+    options.add_argument("--headless=new")
     options.add_argument("--window-size=1920,1080")
     options.add_argument("--log-level=3")
+
+    # Windows
+    if os.name == "nt":
+        options.add_argument("--disable-gpu")
+    # Linux / Render
+    else:
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-dev-shm-usage")
 
     driver = webdriver.Chrome(
         service=Service(ChromeDriverManager().install()),
@@ -43,12 +50,13 @@ def scrape_and_store():
 
     try:
         driver.get("https://www.dsebd.org/latest_share_price_scroll_l.php")
-        time.sleep(5)  # 🔑 wait for JS
+        time.sleep(5)  # wait for JS to load
 
         rows = driver.find_elements(By.CSS_SELECTOR, "table.shares-table tbody tr")
 
-        today = datetime.utcnow().date().isoformat()
         now = datetime.utcnow()
+        today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        today_end = today_start + timedelta(days=1)
 
         stocks = []
 
@@ -73,19 +81,27 @@ def scrape_and_store():
                 "low": low,
                 "close": ltp,
                 "volume": volume,
-                "date": today,
-                "timestamp": now
+                "date": now.date().isoformat(),  # daily label
+                "timestamp": now                 # real chronological time
             })
 
         print(f"📊 Parsed {len(stocks)} stocks")
 
         upserted = 0
+
         for stock in stocks:
             res = collection.update_one(
-                {"symbol": stock["symbol"], "date": stock["date"]},
+                {
+                    "symbol": stock["symbol"],
+                    "timestamp": {
+                        "$gte": today_start,
+                        "$lt": today_end
+                    }
+                },
                 {"$set": stock},
                 upsert=True
             )
+
             if res.upserted_id:
                 upserted += 1
 

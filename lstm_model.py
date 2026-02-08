@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ---------------- CONFIG ----------------
-LOOKBACK_DAYS = 10        # ⚠️ unchanged
+LOOKBACK_DAYS = 10
 FUTURE_DAYS = 7
 EPOCHS = 25
 BATCH_SIZE = 16
@@ -27,20 +27,45 @@ if not MONGO_URI:
 
 client = MongoClient(MONGO_URI)
 prices_col = client["dse"]["prices"]
+sentiment_col = client["dse"]["sentiment"]
 pred_col = client["dse"]["predictions"]
 
 # ---------------- DATA ----------------
-def get_daily_close(symbol: str):
-    cursor = prices_col.find(
-        {"symbol": symbol},
-        {"_id": 0, "close": 1}
-    ).sort("timestamp", 1)
+def get_price_sentiment_series(symbol: str):
+    prices = list(
+        prices_col.find(
+            {"symbol": symbol, "close": {"$gt": 0}},
+            {"_id": 0, "date": 1, "close": 1}
+        ).sort("date", 1)
+    )
 
-    return [
-        float(d["close"])
-        for d in cursor
-        if d.get("close") and d["close"] > 0
-    ]
+    if not prices:
+        return []
+
+    sentiment_by_date = {}
+    for s in sentiment_col.find({"symbol": "MARKET"}, {"_id": 0}):
+        d = s.get("date")
+        if d and isinstance(s.get("sentiment"), (int, float)):
+            sentiment_by_date.setdefault(d, []).append(float(s["sentiment"]))
+
+    daily_sentiment = {
+        d: sum(v) / len(v) for d, v in sentiment_by_date.items()
+    }
+
+    series = []
+    last_sentiment = 0.0
+
+    for p in prices:
+        day = p["date"]
+        if day in daily_sentiment:
+            last_sentiment = daily_sentiment[day]
+
+        series.append([
+            float(p["close"]),
+            float(last_sentiment)
+        ])
+
+    return np.array(series, dtype=np.float32)
 
 
 # ---------------- MODEL UTILS ----------------
@@ -51,7 +76,7 @@ def model_path(symbol: str):
 
 def build_model():
     model = Sequential([
-        LSTM(64, input_shape=(LOOKBACK_DAYS, 1)),
+        LSTM(64, input_shape=(LOOKBACK_DAYS, 2)),
         Dense(1)
     ])
     model.compile(optimizer="adam", loss="mse")
@@ -63,7 +88,6 @@ def predict_future(symbol: str):
     symbol = symbol.upper()
     today = datetime.utcnow().date().isoformat()
 
-    # 🔹 1. Return cached prediction if exists
     cached = pred_col.find_one({"symbol": symbol, "date": today})
     if cached:
         return {
@@ -72,21 +96,17 @@ def predict_future(symbol: str):
             "confidence": cached["confidence"],
         }, None
 
-    closes = get_daily_close(symbol)
-    if len(closes) < LOOKBACK_DAYS + FUTURE_DAYS:
+    data = get_price_sentiment_series(symbol)
+    if len(data) < LOOKBACK_DAYS + FUTURE_DAYS:
         return None, "Not enough data"
 
-    closes = np.array(closes, dtype=np.float32).reshape(-1, 1)
-
-    # -------- SCALING --------
     scaler = MinMaxScaler()
-    scaled = scaler.fit_transform(closes)
+    scaled = scaler.fit_transform(data)
 
-    # -------- SEQUENCES --------
     X, y = [], []
     for i in range(LOOKBACK_DAYS, len(scaled)):
         X.append(scaled[i - LOOKBACK_DAYS:i])
-        y.append(scaled[i])
+        y.append(scaled[i][0])  # predict CLOSE only
 
     X, y = np.array(X), np.array(y)
 
@@ -94,7 +114,6 @@ def predict_future(symbol: str):
     X_train, y_train = X[:split], y[:split]
     X_val, y_val = X[split:], y[split:]
 
-    # -------- LOAD OR TRAIN MODEL --------
     path = model_path(symbol)
 
     if os.path.exists(path):
@@ -110,41 +129,39 @@ def predict_future(symbol: str):
         )
         model.save(path)
 
-    # -------- CONFIDENCE (RESIDUALS) --------
     val_preds = model.predict(X_val, verbose=0).flatten()
-    residuals = scaler.inverse_transform(
-        (y_val.flatten() - val_preds).reshape(-1, 1)
-    ).flatten()
+    residuals = y_val - val_preds
+    sigma = float(np.std(residuals))
+    confidence = [sigma] * FUTURE_DAYS
 
-    sigma = np.std(residuals)
-    confidence = [float(sigma)] * FUTURE_DAYS
-
-    # -------- FUTURE FORECAST --------
+    last_seq = scaled[-LOOKBACK_DAYS:].reshape(1, LOOKBACK_DAYS, 2)
     future_scaled = []
-    last_seq = scaled[-LOOKBACK_DAYS:].reshape(1, LOOKBACK_DAYS, 1)
 
     for _ in range(FUTURE_DAYS):
-        next_val = model.predict(last_seq, verbose=0)[0][0]
-        future_scaled.append(next_val)
+        next_close = model.predict(last_seq, verbose=0)[0][0]
+        future_scaled.append(next_close)
+
+        next_step = np.array([[next_close, last_seq[0, -1, 1]]])
+        next_step = scaler.transform(next_step)
+
         last_seq = np.concatenate(
-            [last_seq[:, 1:, :], [[[next_val]]]],
+            [last_seq[:, 1:, :], next_step.reshape(1, 1, 2)],
             axis=1
         )
 
     future = scaler.inverse_transform(
-        np.array(future_scaled).reshape(-1, 1)
-    ).flatten()
+        np.column_stack([future_scaled, np.zeros(FUTURE_DAYS)])
+    )[:, 0]
 
     result = {
         "symbol": symbol,
         "date": today,
-        "last_close": float(closes[-1][0]),
+        "last_close": float(data[-1][0]),
         "future_7_days": future.tolist(),
         "confidence": confidence,
         "created_at": datetime.utcnow()
     }
 
-    # 🔹 2. Persist daily prediction
     pred_col.insert_one(result)
 
     return {

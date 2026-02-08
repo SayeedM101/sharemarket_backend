@@ -10,3 +10,5 @@ webdriver-manager
 numpy
 scikit-learn
 tensorflow
+vaderSentiment
+feedparser

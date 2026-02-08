@@ -1,93 +1,85 @@
-# main.py
-
 from fastapi import FastAPI, HTTPException
-from scraper import scrape_and_store
-from lstm_model import predict_future
+from datetime import datetime
 from pymongo import MongoClient
 import os
-from dotenv import load_dotenv
-import traceback
 
+from scraper import scrape_and_store
+from sentiment_scraper import scrape_market_sentiment
+
+from dotenv import load_dotenv
 load_dotenv()
 
-app = FastAPI(title="DSE Stock API")
-
+# ---------------- CONFIG ----------------
 MONGO_URI = os.getenv("MONGO_URI")
 client = MongoClient(MONGO_URI)
-collection = client["dse"]["prices"]
+
+price_col = client["dse"]["prices"]
+market_sentiment_col = client["dse"]["market_sentiment"]
+
+app = FastAPI()
+
 
 # ---------------- STARTUP ----------------
-
 @app.on_event("startup")
-def startup_job():
-    print("🚀 API started → running daily scraper")
+def startup():
+    print("🚀 API starting...")
 
-    try:
-        scrape_and_store()
-        print("✅ Daily scraper finished successfully")
-    except Exception as e:
-        print("⚠️ Scraper failed on startup")
-        print(str(e))
-        traceback.print_exc()
+    print("📈 Running PRICE scraper...")
+    scrape_and_store()
 
-# ---------------- ROOT ----------------
-@app.get("/")
-def root():
-    return {"status": "API running"}
+    print("📰 Running MARKET SENTIMENT scraper...")
+    scrape_market_sentiment(days=30)
 
-# ---------------- HISTORY ----------------
-@app.get("/stocks/history/{symbol}")
-def history(symbol: str, limit: int = 60):
-    data = list(
-        collection.find(
-            {"symbol": symbol.upper()},
-            {"_id": 0}
-        )
-        .sort("timestamp", 1)
-        .limit(limit)
-    )
+    print("✅ Scrapers finished")
 
-    if not data:
-        raise HTTPException(404, "No data found")
 
-    return data
-
-# ---------------- PREDICTION ----------------
-@app.get("/stocks/predict/{symbol}")
-def predict(symbol: str):
-    result, error = predict_future(symbol.upper())
-
-    if error:
-        raise HTTPException(400, error)
-
-    return {
-        "symbol": symbol.upper(),
-        "last_close": result["last_close"],
-        "future_7_days": result["future_7_days"],
-    }
-
-# ---------------- COMBINED ENDPOINT (IMPORTANT) ----------------
+# ---------------- FORECAST API ----------------
 @app.get("/stocks/forecast/{symbol}")
-def forecast(symbol: str):
-    history = list(
-        collection.find(
-            {"symbol": symbol.upper()},
-            {"_id": 0}
-        )
-        .sort("timestamp", -1)
-        .limit(60)
+def stock_forecast(symbol: str):
+    symbol = symbol.upper()
+
+    prices = list(
+        price_col.find(
+            {"symbol": symbol},
+            {"_id": 0, "date": 1, "close": 1}
+        ).sort("date", 1)
     )
 
-    if not history:
-        raise HTTPException(404, "No data")
+    if len(prices) < 10:
+        raise HTTPException(status_code=404, detail="Not enough price data")
 
-    result, error = predict_future(symbol.upper())
-    if error:
-        raise HTTPException(400, error)
+    history = [
+        {
+            "date": p["date"],
+            "price": float(p["close"])
+        }
+        for p in prices
+        if p.get("close") is not None
+    ]
+
+    # 🔮 Dummy LSTM output (replace later)
+    last_price = history[-1]["price"]
+    future_7_days = [
+        round(last_price * (1 + i * 0.01), 2)
+        for i in range(1, 8)
+    ]
 
     return {
-        "symbol": symbol.upper(),
+        "symbol": symbol,
         "history": history,
-        "last_close": result["last_close"],
-        "future_7_days": result["future_7_days"],
+        "future7Days": future_7_days
     }
+
+
+# ---------------- DEBUG SENTIMENT ----------------
+@app.get("/market/sentiment")
+def get_market_sentiment():
+    docs = list(
+        market_sentiment_col.find(
+            {},
+            {"_id": 0, "date": 1, "sentiment": 1}
+        ).sort("date", 1)
+    )
+    return docs
+    
+

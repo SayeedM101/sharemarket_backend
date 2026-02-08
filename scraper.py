@@ -1,11 +1,10 @@
-# scraper.py (SELENIUM VERSION – FIXED TIMELINE)
-
+# scraper.py
 from dotenv import load_dotenv
 load_dotenv()
 
 import os
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, date
 from pymongo import MongoClient
 
 from selenium import webdriver
@@ -14,34 +13,26 @@ from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from webdriver_manager.chrome import ChromeDriverManager
 
-# ---------------- MONGODB ----------------
+# ---------- MONGODB ----------
 MONGO_URI = os.getenv("MONGO_URI")
 client = MongoClient(MONGO_URI)
-collection = client["dse"]["prices"]
+price_col = client["dse"]["prices"]
 
-# ---------------- HELPERS ----------------
+# ---------- HELPERS ----------
 def to_float(val):
     try:
         return float(val.replace(",", "").strip())
     except Exception:
         return None
 
-# ---------------- SCRAPER ----------------
+# ---------- SCRAPER ----------
 def scrape_and_store():
-    print("🌐 Launching browser for DSE scrape...")
+    print("🌐 Running DSE daily OHLC scraper")
 
     options = Options()
     options.add_argument("--headless=new")
     options.add_argument("--window-size=1920,1080")
     options.add_argument("--log-level=3")
-
-    # Windows
-    if os.name == "nt":
-        options.add_argument("--disable-gpu")
-    # Linux / Render
-    else:
-        options.add_argument("--no-sandbox")
-        options.add_argument("--disable-dev-shm-usage")
 
     driver = webdriver.Chrome(
         service=Service(ChromeDriverManager().install()),
@@ -50,15 +41,12 @@ def scrape_and_store():
 
     try:
         driver.get("https://www.dsebd.org/latest_share_price_scroll_l.php")
-        time.sleep(5)  # wait for JS to load
+        time.sleep(5)
 
         rows = driver.find_elements(By.CSS_SELECTOR, "table.shares-table tbody tr")
 
-        now = datetime.utcnow()
-        today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        today_end = today_start + timedelta(days=1)
-
-        stocks = []
+        market_date = date.today()
+        day_ts = datetime.combine(market_date, datetime.min.time())
 
         for row in rows:
             cols = row.find_elements(By.TAG_NAME, "td")
@@ -66,46 +54,48 @@ def scrape_and_store():
                 continue
 
             symbol = cols[1].text.strip().upper()
-            ltp = to_float(cols[2].text)
+            close = to_float(cols[2].text)
             high = to_float(cols[3].text)
             low = to_float(cols[4].text)
             volume = to_float(cols[9].text) or 0.0
 
-            if not symbol or ltp is None:
+            if not symbol or close is None:
                 continue
 
-            stocks.append({
+            existing = price_col.find_one({
                 "symbol": symbol,
-                "open": ltp,
-                "high": high,
-                "low": low,
-                "close": ltp,
-                "volume": volume,
-                "date": now.date().isoformat(),  # daily label
-                "timestamp": now                 # real chronological time
+                "date": market_date.isoformat()
             })
 
-        print(f"📊 Parsed {len(stocks)} stocks")
-
-        upserted = 0
-
-        for stock in stocks:
-            res = collection.update_one(
-                {
-                    "symbol": stock["symbol"],
-                    "timestamp": {
-                        "$gte": today_start,
-                        "$lt": today_end
+            if existing:
+                price_col.update_one(
+                    {"_id": existing["_id"]},
+                    {
+                        "$set": {
+                            "high": max(existing["high"], high or close),
+                            "low": min(existing["low"], low or close),
+                            "close": close,
+                            "volume": volume
+                        }
                     }
-                },
-                {"$set": stock},
-                upsert=True
-            )
+                )
+            else:
+                price_col.insert_one({
+                    "symbol": symbol,
+                    "date": market_date.isoformat(),
+                    "timestamp": day_ts,
+                    "open": None,  # not available from source
+                    "high": high or close,
+                    "low": low or close,
+                    "close": close,
+                    "volume": volume
+                })
 
-            if res.upserted_id:
-                upserted += 1
-
-        print(f"✅ Upserted {upserted} records")
+        print("✅ OHLC stored safely")
 
     finally:
         driver.quit()
+
+
+if __name__ == "__main__":
+    scrape_and_store()

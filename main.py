@@ -5,6 +5,7 @@ import os
 
 from scraper import scrape_and_store
 from sentiment_scraper import scrape_market_sentiment
+from lstm_model import calculate_and_store_mse
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -31,6 +32,9 @@ def startup():
     scrape_market_sentiment(days=30)
 
     print("✅ Scrapers finished")
+
+    
+    calculate_and_store_mse()
 
 
 # ---------------- FORECAST API ----------------
@@ -81,5 +85,3 @@ def get_market_sentiment():
         ).sort("date", 1)
     )
     return docs
-    
-

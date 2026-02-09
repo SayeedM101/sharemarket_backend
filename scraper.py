@@ -3,20 +3,17 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import os
-import time
+import requests
+from bs4 import BeautifulSoup
 from datetime import datetime, date
 from pymongo import MongoClient
-
-from selenium import webdriver
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.by import By
-from webdriver_manager.chrome import ChromeDriverManager
 
 # ---------- MONGODB ----------
 MONGO_URI = os.getenv("MONGO_URI")
 client = MongoClient(MONGO_URI)
 price_col = client["dse"]["prices"]
+
+URL = "https://www.dsebd.org/latest_share_price_scroll_l.php"
 
 # ---------- HELPERS ----------
 def to_float(val):
@@ -27,75 +24,73 @@ def to_float(val):
 
 # ---------- SCRAPER ----------
 def scrape_and_store():
-    print("🌐 Running DSE daily OHLC scraper")
+    print("🌐 Running DSE scraper (no Selenium)")
 
-    options = Options()
-    options.add_argument("--headless=new")
-    options.add_argument("--window-size=1920,1080")
-    options.add_argument("--log-level=3")
+    headers = {
+        "User-Agent": "Mozilla/5.0"
+    }
 
-    driver = webdriver.Chrome(
-        service=Service(ChromeDriverManager().install()),
-        options=options
-    )
+    response = requests.get(URL, headers=headers, timeout=15)
+    response.raise_for_status()
 
-    try:
-        driver.get("https://www.dsebd.org/latest_share_price_scroll_l.php")
-        time.sleep(5)
+    soup = BeautifulSoup(response.text, "html.parser")
+    rows = soup.select("table.shares-table tbody tr")
 
-        rows = driver.find_elements(By.CSS_SELECTOR, "table.shares-table tbody tr")
+    market_date = date.today()
+    day_ts = datetime.combine(market_date, datetime.min.time())
 
-        market_date = date.today()
-        day_ts = datetime.combine(market_date, datetime.min.time())
+    inserted = 0
+    updated = 0
 
-        for row in rows:
-            cols = row.find_elements(By.TAG_NAME, "td")
-            if len(cols) < 10:
-                continue
+    for row in rows:
+        cols = row.find_all("td")
+        if len(cols) < 10:
+            continue
 
-            symbol = cols[1].text.strip().upper()
-            close = to_float(cols[2].text)
-            high = to_float(cols[3].text)
-            low = to_float(cols[4].text)
-            volume = to_float(cols[9].text) or 0.0
+        symbol = cols[1].get_text(strip=True).upper()
+        close = to_float(cols[2].get_text())
+        high = to_float(cols[3].get_text())
+        low = to_float(cols[4].get_text())
+        volume = to_float(cols[9].get_text()) or 0.0
 
-            if not symbol or close is None:
-                continue
+        if not symbol or close is None:
+            continue
 
-            existing = price_col.find_one({
-                "symbol": symbol,
-                "date": market_date.isoformat()
-            })
+        existing = price_col.find_one({
+            "symbol": symbol,
+            "date": market_date.isoformat()
+        })
 
-            if existing:
-                price_col.update_one(
-                    {"_id": existing["_id"]},
-                    {
-                        "$set": {
-                            "high": max(existing["high"], high or close),
-                            "low": min(existing["low"], low or close),
-                            "close": close,
-                            "volume": volume
-                        }
+        if existing:
+            price_col.update_one(
+                {"_id": existing["_id"]},
+                {
+                    "$set": {
+                        "high": max(existing["high"], high or close),
+                        "low": min(existing["low"], low or close),
+                        "close": close,
+                        "volume": volume
                     }
-                )
-            else:
-                price_col.insert_one({
-                    "symbol": symbol,
-                    "date": market_date.isoformat(),
-                    "timestamp": day_ts,
-                    "open": None,  # not available from source
-                    "high": high or close,
-                    "low": low or close,
-                    "close": close,
-                    "volume": volume
-                })
+                }
+            )
+            updated += 1
+        else:
+            price_col.insert_one({
+                "symbol": symbol,
+                "date": market_date.isoformat(),
+                "timestamp": day_ts,
+                "open": None,
+                "high": high or close,
+                "low": low or close,
+                "close": close,
+                "volume": volume
+            })
+            inserted += 1
 
-        print("✅ OHLC stored safely")
+    print(f"✅ Done | Inserted: {inserted}, Updated: {updated}")
 
-    finally:
-        driver.quit()
-
-
-if __name__ == "__main__":
-    scrape_and_store()
+    return {
+        "inserted": inserted,
+        "updated": updated,
+        "date": market_date.isoformat()
+    }

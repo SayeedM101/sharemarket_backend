@@ -2,7 +2,7 @@
 
 import os
 import numpy as np
-from datetime import datetime
+from datetime import datetime, timedelta
 from pymongo import MongoClient
 from sklearn.preprocessing import MinMaxScaler
 from tensorflow.keras.models import Sequential, load_model
@@ -22,12 +22,10 @@ os.makedirs(MODEL_DIR, exist_ok=True)
 
 # ---------------- MONGODB ----------------
 MONGO_URI = os.getenv("MONGO_URI")
-if not MONGO_URI:
-    raise RuntimeError("MONGO_URI not set")
-
 client = MongoClient(MONGO_URI)
+
 prices_col = client["dse"]["prices"]
-sentiment_col = client["dse"]["sentiment"]
+market_sentiment_col = client["dse"]["market_sentiment"]
 pred_col = client["dse"]["predictions"]
 
 # ---------------- DATA ----------------
@@ -43,7 +41,7 @@ def get_price_sentiment_series(symbol: str):
         return []
 
     sentiment_by_date = {}
-    for s in sentiment_col.find({"symbol": "MARKET"}, {"_id": 0}):
+    for s in market_sentiment_col.find({"symbol": "MARKET"}, {"_id": 0}):
         d = s.get("date")
         if d and isinstance(s.get("sentiment"), (int, float)):
             sentiment_by_date.setdefault(d, []).append(float(s["sentiment"]))
@@ -67,8 +65,7 @@ def get_price_sentiment_series(symbol: str):
 
     return np.array(series, dtype=np.float32)
 
-
-# ---------------- MODEL UTILS ----------------
+# ---------------- MODEL ----------------
 def model_path(symbol: str):
     today = datetime.utcnow().date().isoformat()
     return os.path.join(MODEL_DIR, f"{symbol}_{today}.keras")
@@ -82,8 +79,7 @@ def build_model():
     model.compile(optimizer="adam", loss="mse")
     return model
 
-
-# ---------------- MAIN PREDICTION ----------------
+# ---------------- PREDICTION ----------------
 def predict_future(symbol: str):
     symbol = symbol.upper()
     today = datetime.utcnow().date().isoformat()
@@ -106,7 +102,7 @@ def predict_future(symbol: str):
     X, y = [], []
     for i in range(LOOKBACK_DAYS, len(scaled)):
         X.append(scaled[i - LOOKBACK_DAYS:i])
-        y.append(scaled[i][0])  # predict CLOSE only
+        y.append(scaled[i][0])
 
     X, y = np.array(X), np.array(y)
 
@@ -120,13 +116,7 @@ def predict_future(symbol: str):
         model = load_model(path)
     else:
         model = build_model()
-        model.fit(
-            X_train,
-            y_train,
-            epochs=EPOCHS,
-            batch_size=BATCH_SIZE,
-            verbose=0
-        )
+        model.fit(X_train, y_train, epochs=EPOCHS, batch_size=BATCH_SIZE, verbose=0)
         model.save(path)
 
     val_preds = model.predict(X_val, verbose=0).flatten()
@@ -169,3 +159,37 @@ def predict_future(symbol: str):
         "future_7_days": result["future_7_days"],
         "confidence": result["confidence"],
     }, None
+
+# ---------------- MSE ----------------
+def calculate_and_store_mse():
+    print("📐 Calculating MSE...")
+
+    predictions = pred_col.find({"mse": {"$exists": False}})
+
+    for p in predictions:
+        symbol = p["symbol"]
+        predicted = p["future_7_days"]
+
+        actual_prices = list(
+            prices_col.find(
+                {"symbol": symbol, "date": {"$gt": p["date"]}},
+                {"_id": 0, "close": 1}
+            ).sort("date", 1).limit(len(predicted))
+        )
+
+        if len(actual_prices) < 2:
+            continue
+
+        actual = [float(x["close"]) for x in actual_prices]
+        mse = float(np.mean((np.array(actual) - np.array(predicted[:len(actual)])) ** 2))
+
+        pred_col.update_one(
+            {"_id": p["_id"]},
+            {"$set": {
+                "actual_7_days": actual,
+                "mse": mse,
+                "evaluated_at": datetime.utcnow()
+            }}
+        )
+
+        print(f"✅ MSE stored for {symbol}: {mse:.4f}")
